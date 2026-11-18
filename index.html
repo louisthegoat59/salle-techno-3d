@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Salle de techno — visite 3D</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; font-family: -apple-system, system-ui, sans-serif;
+               overscroll-behavior: none; touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  #ui { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; }
+  #card { pointer-events: auto; background: rgba(15, 17, 20, .78); color: #f4f4f2; padding: 22px 26px; border-radius: 14px;
+          max-width: 440px; line-height: 1.5; backdrop-filter: blur(8px); cursor: pointer; }
+  #card h1 { font-size: 17px; margin: 0 0 8px; font-weight: 600; }
+  #card p { margin: 4px 0; font-size: 14px; color: #c9cbcf; }
+  #card kbd { background: #2a2d33; border-radius: 5px; padding: 1px 6px; font-size: 12px; color: #fff; }
+  #vr { margin-top: 14px; width: 100%; font: inherit; font-size: 16px; font-weight: 600; padding: 12px 16px; border: 0;
+        border-radius: 10px; background: #f4f4f2; color: #111; cursor: pointer; }
+  #vr:active { transform: scale(.98); }
+  #bar { height: 3px; background: #2a2d33; border-radius: 2px; margin-top: 14px; overflow: hidden; }
+  #bar i { display: block; height: 100%; width: 0; background: #f4f4f2; transition: width .2s; }
+  /* phones and tablets: walking stick bottom left; dragging anywhere else looks around */
+  #joy { position: fixed; left: calc(env(safe-area-inset-left) + 26px); bottom: calc(env(safe-area-inset-bottom) + 30px);
+         width: 120px; height: 120px; box-sizing: border-box; border-radius: 50%; border: 2px solid rgba(255, 255, 255, .6);
+         background: rgba(15, 17, 20, .34); box-shadow: 0 2px 14px rgba(0, 0, 0, .22); pointer-events: none; }
+  #joy i { position: absolute; left: 50%; top: 50%; width: 54px; height: 54px; margin: -27px 0 0 -27px; border-radius: 50%;
+           background: rgba(244, 244, 242, .95); box-shadow: 0 2px 10px rgba(0, 0, 0, .45); }
+  .hidden { display: none !important; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui"><div id="card">
+  <h1>Salle de techno — visite 3D</h1>
+  <p id="msg">Chargement…</p>
+  <p id="help" class="hidden">Clique pour entrer. <kbd>Z</kbd><kbd>Q</kbd><kbd>S</kbd><kbd>D</kbd> (ou flèches) pour marcher,
+    souris pour regarder, <kbd>Maj</kbd> pour aller plus vite, <kbd>Échap</kbd> pour sortir.</p>
+  <p id="helpTouch" class="hidden">Touche l'écran pour entrer. Pouce sur le rond en bas à gauche pour marcher,
+    glisse le doigt ailleurs pour regarder autour.</p>
+  <button id="vr" class="hidden" type="button">Entrer en VR</button>
+  <p id="vrhelp" class="hidden">En VR : joystick gauche pour marcher, joystick droit pour tourner,
+    gâchette (ou pincer) puis relâcher pour se téléporter.</p>
+  <p id="vrhint" class="hidden"></p>
+  <div id="bar"><i></i></div>
+</div></div>
+<div id="joy" class="hidden"><i></i></div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
+import { upgradeMaterials } from './materials.js';
+
+const q = new URLSearchParams(location.search);
+
+// Test hook: ?emulate installs Meta's WebXR emulator (IWER), so VR can be checked without a headset.
+if (q.has('emulate')) {
+  const iwer = await import('https://cdn.jsdelivr.net/npm/iwer@2.8.0/build/iwer.module.js');
+  const dev = new iwer.XRDevice(iwer.metaQuest3, { stereoEnabled: true });
+  dev.installRuntime({ forceInstall: true });
+  window.__xrDevice = dev;
+}
+
+const xrOK = navigator.xr ? await navigator.xr.isSessionSupported('immersive-vr').catch(() => false) : false;
+// Phones and tablets: walking stick + drag to look (?touch forces it on a computer).
+const touch = q.has('touch') || (navigator.maxTouchPoints > 0 && matchMedia('(pointer: coarse)').matches);
+// Headsets, phones and tablets get the KTX2 build (GPU-compressed textures: 4-8x less video memory, no JPEG
+// decoding): a phone runs out of video memory with the JPEG one.
+const file = q.get('glb') || ((xrOK || touch) && !q.has('jpeg') ? 'salle_techno_vr.glb' : 'salle_techno.glb');
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.NoToneMapping;
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+renderer.xr.setFoveation(Number(q.get('foveation') ?? 0.4));
+if (q.get('xrscale')) renderer.xr.setFramebufferScaleFactor(Number(q.get('xrscale')));
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xd9dee2);
+// lights only the VR controllers and hands: the room is baked and its materials ignore scene lights
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8a8a, 2.2));
+const camera = new THREE.PerspectiveCamera(Number(q.get('fov') || 70), innerWidth / innerHeight, 0.03, 300);
+// A phone held upright would see the room through a slot (36 degrees across): keep at least 55 degrees across.
+function fitFov() {
+  const across = 55 * Math.PI / 180;
+  camera.fov = q.get('fov') ? Number(q.get('fov'))
+    : Math.max(70, 2 * Math.atan(Math.tan(across / 2) / camera.aspect) * 180 / Math.PI);
+  camera.updateProjectionMatrix();
+}
+fitFov();
+camera.rotation.order = 'YXZ';
+// In VR the headset moves the camera inside the rig; walking, turning and teleporting move the rig.
+const rig = new THREE.Group();
+rig.add(camera);
+scene.add(rig);
+
+// Blender (x, y, z) -> glTF/three (x, z, -y)
+const B = (x, y, z) => new THREE.Vector3(x, z, -y);
+const EYE = 1.6;
+let pos = B(1.6, 3.35, EYE), yaw = 0, pitch = 0;
+function lookAt(t) {
+  const d = t.clone().sub(pos);
+  yaw = Math.atan2(-d.x, -d.z);
+  pitch = Math.atan2(d.y, Math.hypot(d.x, d.z));
+}
+lookAt(B(17.6, 3.6, 1.2));
+if (q.get('cam')) {   // cam=x,y,z,tx,ty,tz in Blender coordinates (used for screenshots)
+  const v = q.get('cam').split(',').map(Number);
+  pos = B(v[0], v[1], v[2]);
+  lookAt(B(v[3], v[4], v[5]));
+}
+
+// ------------------------------------------------------------------ walkable plan
+// Occupancy grid of the plan (Blender x, y), 5 cm cells: everything between ankle and head height blocks,
+// grown by the body radius. Built from the model itself, so walls, desks, chairs and bikes all stop you.
+const G = { x0: -0.3, y0: -0.3, c: 0.05, nx: 0, ny: 0, free: null };
+function buildGrid(root) {
+  const x1 = 17.9, y1 = 7.1;
+  const nx = Math.ceil((x1 - G.x0) / G.c), ny = Math.ceil((y1 - G.y0) / G.c);
+  const occ = new Uint8Array(nx * ny);
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  root.updateMatrixWorld(true);
+  root.traverse((o) => {
+    if (!o.isMesh || /exterior/i.test(o.name + (o.material?.name || ''))) return;
+    const pa = o.geometry.attributes.position, ix = o.geometry.index, n = ix ? ix.count : pa.count;
+    for (let i = 0; i < n; i += 3) {
+      a.fromBufferAttribute(pa, ix ? ix.getX(i) : i).applyMatrix4(o.matrixWorld);
+      b.fromBufferAttribute(pa, ix ? ix.getX(i + 1) : i + 1).applyMatrix4(o.matrixWorld);
+      c.fromBufferAttribute(pa, ix ? ix.getX(i + 2) : i + 2).applyMatrix4(o.matrixWorld);
+      if (Math.max(a.y, b.y, c.y) < 0.12 || Math.min(a.y, b.y, c.y) > 1.75) continue;  // floor level / overhead
+      // plan coordinates: x = three.x, y = -three.z
+      const i0 = Math.floor((Math.min(a.x, b.x, c.x) - G.x0) / G.c), i1 = Math.floor((Math.max(a.x, b.x, c.x) - G.x0) / G.c);
+      const j0 = Math.floor((Math.min(-a.z, -b.z, -c.z) - G.y0) / G.c), j1 = Math.floor((Math.max(-a.z, -b.z, -c.z) - G.y0) / G.c);
+      if (i1 < 0 || j1 < 0 || i0 >= nx || j0 >= ny || i1 - i0 > 400 || j1 - j0 > 400) continue;
+      for (let j = Math.max(0, j0); j <= Math.min(ny - 1, j1); j++)
+        for (let k = Math.max(0, i0); k <= Math.min(nx - 1, i1); k++) occ[j * nx + k] = 1;
+    }
+  });
+  // grow by the body radius (22 cm)
+  const r = Math.round(0.22 / G.c), free = new Uint8Array(nx * ny);
+  const off = [];
+  for (let dj = -r; dj <= r; dj++) for (let di = -r; di <= r; di++) if (di * di + dj * dj <= r * r) off.push([di, dj]);
+  for (let j = 0; j < ny; j++) for (let k = 0; k < nx; k++) {
+    let ok = 1;
+    for (const [di, dj] of off) {
+      const kk = k + di, jj = j + dj;
+      if (kk < 0 || jj < 0 || kk >= nx || jj >= ny || occ[jj * nx + kk]) { ok = 0; break; }
+    }
+    free[j * nx + k] = ok;
+  }
+  Object.assign(G, { nx, ny, free });
+}
+// walkable(x, y) in Blender plan coordinates
+const inRoom = (x, y) => x > 0.15 && x < 17.45 && y > 0.15 && y < 6.65 && !(x > 9.3 && x < 9.9 && y < 1.95);
+function walkable(x, y) {
+  if (!inRoom(x, y)) return false;
+  if (!G.free) return true;
+  const k = Math.floor((x - G.x0) / G.c), j = Math.floor((y - G.y0) / G.c);
+  return k >= 0 && j >= 0 && k < G.nx && j < G.ny && G.free[j * G.nx + k] === 1;
+}
+function nearestWalkable(x, y) {
+  if (walkable(x, y)) return [x, y];
+  for (let r = 0.05; r < 3; r += 0.05)
+    for (let t = 0; t < 32; t++) {
+      const xx = x + r * Math.cos(t * Math.PI / 16), yy = y + r * Math.sin(t * Math.PI / 16);
+      if (walkable(xx, yy)) return [xx, yy];
+    }
+  return [x, y];
+}
+
+// ------------------------------------------------------------------ loading
+const draco = new DRACOLoader();
+draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/draco/gltf/');
+const ktx2 = new KTX2Loader();
+ktx2.setTranscoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/basis/');
+ktx2.detectSupport(renderer);
+const loader = new GLTFLoader();
+loader.setDRACOLoader(draco);
+loader.setKTX2Loader(ktx2);
+const bar = document.querySelector('#bar i'), msg = document.getElementById('msg');
+const vrBtn = document.getElementById('vr');
+let world = null, ready = false;
+const MB = (n) => (n / 1e6).toFixed(0);
+function loadGLB(name) {
+  // No cache-buster: serve.py sends no-cache (the browser revalidates after a re-bake), and on GitHub Pages
+  // a returning visitor must not download 30-70 MB again.
+  return new Promise((res, rej) => loader.load(name, res, (e) => {
+    if (!e.total) return;
+    bar.style.width = (100 * e.loaded / e.total).toFixed(0) + '%';
+    msg.textContent = `Chargement… ${MB(e.loaded)} / ${MB(e.total)} Mo`;
+  }, rej));
+}
+async function start() {
+  let gltf, loaded = file;
+  try { gltf = await loadGLB(file); }
+  catch (err) {
+    if (file === 'salle_techno.glb') throw err;
+    console.warn('falling back to the JPEG build:', err.message);
+    gltf = await loadGLB(loaded = 'salle_techno.glb');
+  }
+  const aniso = renderer.capabilities.getMaxAnisotropy();
+  gltf.scene.traverse((o) => {
+    if (!o.isMesh) return;
+    const m = o.material;
+    m.toneMapped = false;
+    if (m.map) { m.map.anisotropy = aniso; m.map.needsUpdate = true; }
+  });
+  world = gltf.scene;
+  scene.add(world);
+  buildGrid(world);
+  const [sx, sy] = nearestWalkable(pos.x, -pos.z);
+  pos.x = sx; pos.z = -sy;
+  msg.textContent = 'Chargement des détails…';
+  if (!q.has('flat')) window.__upgrade = await upgradeMaterials(gltf, renderer, scene, { aniso, q, ktx2, vr: loaded.includes('_vr') });
+  msg.textContent = 'Prêt.';
+  document.getElementById(touch ? 'helpTouch' : 'help').classList.remove('hidden');
+  ready = true;
+  document.getElementById('bar').classList.add('hidden');
+  if (xrOK) { vrBtn.classList.remove('hidden'); document.getElementById('vrhelp').classList.remove('hidden'); }
+  else if (!window.isSecureContext && navigator.xr === undefined) {
+    const h = document.getElementById('vrhint');
+    h.textContent = `Pour la VR : dans le navigateur du casque, ouvre https://${location.hostname}:8443`;
+    h.classList.remove('hidden');
+  }
+  if (q.get('cam')) document.getElementById('ui').classList.add('hidden');
+  requestAnimationFrame(() => requestAnimationFrame(() => { window.__ready = true; }));
+}
+start().catch((err) => { console.error(err); msg.textContent = 'Erreur de chargement : ' + err.message; });
+
+// ------------------------------------------------------------------ desktop: look + walk
+const canvas = renderer.domElement;
+let dragging = false;
+// a click enters with pointer lock; on a touch screen a tap hides the card and shows the walking stick
+function enter() {
+  if (renderer.xr.isPresenting) return;
+  if (!touch) { canvas.requestPointerLock?.(); return; }
+  if (!ready) return;
+  document.getElementById('ui').classList.add('hidden');
+  joy.classList.remove('hidden');
+}
+document.getElementById('card').addEventListener('click', (e) => { if (e.target !== vrBtn) enter(); });
+canvas.addEventListener('click', enter);
+document.addEventListener('gesturestart', (e) => e.preventDefault());   // iOS: no page pinch-zoom
+canvas.addEventListener('mousedown', () => { dragging = true; });
+addEventListener('mouseup', () => { dragging = false; });
+document.addEventListener('pointerlockchange', () => {
+  document.getElementById('ui').classList.toggle('hidden', document.pointerLockElement === canvas);
+});
+addEventListener('mousemove', (e) => {
+  if (document.pointerLockElement !== canvas && !dragging) return;
+  yaw -= e.movementX * 0.0022;
+  pitch = Math.max(-1.4, Math.min(1.4, pitch - e.movementY * 0.0022));
+});
+const keys = new Set();
+addEventListener('keydown', (e) => keys.add(e.code));
+addEventListener('keyup', (e) => keys.delete(e.code));
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  fitFov();
+  renderer.setSize(innerWidth, innerHeight);
+});
+// ------------------------------------------------------------------ touch: walking stick + drag to look
+// A finger that lands on (or near) the stick walks; any other finger looks around, as in a mobile game.
+const joy = document.getElementById('joy'), knob = joy.querySelector('i');
+const stick = { id: null, x: 0, y: 0 };            // deflection -1..1, y pointing down the screen
+let lookId = null, lookX = 0, lookY = 0;
+function stickCentre() {
+  const r = joy.getBoundingClientRect();
+  return [r.left + r.width / 2, r.top + r.height / 2, r.width / 2];
+}
+function moveStick(e) {
+  const [cx, cy, R] = stickCentre();
+  let dx = e.clientX - cx, dy = e.clientY - cy;
+  const k = Math.min(1, R / (Math.hypot(dx, dy) || 1));
+  dx *= k; dy *= k;
+  knob.style.transform = `translate(${dx}px, ${dy}px)`;
+  stick.x = dx / R; stick.y = dy / R;
+}
+canvas.addEventListener('pointerdown', (e) => {
+  if (e.pointerType !== 'touch' || renderer.xr.isPresenting) return;
+  const [cx, cy, R] = stickCentre();
+  if (stick.id === null && R > 0 && Math.hypot(e.clientX - cx, e.clientY - cy) < R * 1.6) {
+    stick.id = e.pointerId;
+    moveStick(e);
+  } else if (lookId === null) {
+    lookId = e.pointerId; lookX = e.clientX; lookY = e.clientY;
+  } else return;
+  try { canvas.setPointerCapture(e.pointerId); } catch { /* synthetic events in tests */ }
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (e.pointerId === stick.id) moveStick(e);
+  else if (e.pointerId === lookId) {
+    const k = 2.2 / Math.min(innerWidth, innerHeight);   // a swipe across the short side turns ~125 degrees
+    yaw -= (e.clientX - lookX) * k;
+    pitch = Math.max(-1.4, Math.min(1.4, pitch - (e.clientY - lookY) * k));
+    lookX = e.clientX; lookY = e.clientY;
+  }
+});
+function release(e) {
+  if (e.pointerId === stick.id) { stick.id = null; stick.x = stick.y = 0; knob.style.transform = ''; }
+  if (e.pointerId === lookId) lookId = null;
+}
+canvas.addEventListener('pointerup', release);
+canvas.addEventListener('pointercancel', release);
+
+function desktopStep(dt) {
+  let f = (keys.has('KeyW') || keys.has('ArrowUp') ? 1 : 0) - (keys.has('KeyS') || keys.has('ArrowDown') ? 1 : 0);
+  let s = (keys.has('KeyD') || keys.has('ArrowRight') ? 1 : 0) - (keys.has('KeyA') || keys.has('ArrowLeft') ? 1 : 0);
+  let speed = keys.has('ShiftLeft') || keys.has('ShiftRight') ? 3.4 : 1.5;
+  const m = Math.hypot(stick.x, stick.y);
+  if (m > 0.15) {                                    // walking stick: dead zone, then faster the further it goes
+    const g = (m - 0.15) / 0.85 / m;
+    f -= stick.y * g; s += stick.x * g; speed = 1.8;
+  }
+  if (f || s) {
+    const sp = speed * dt;
+    const fx = -Math.sin(yaw), fz = -Math.cos(yaw);
+    const nx = pos.x + (fx * f + Math.cos(yaw) * s) * sp;
+    const nz = pos.z + (fz * f - Math.sin(yaw) * s) * sp;
+    const stuck = !walkable(pos.x, -pos.z);          // never trap someone who starts inside furniture
+    if (stuck || walkable(nx, -pos.z)) pos.x = nx;
+    if (stuck || walkable(pos.x, -nz)) pos.z = nz;
+  }
+  camera.position.copy(pos);
+  camera.rotation.set(pitch, yaw, 0);
+}
+
+// ------------------------------------------------------------------ VR
+vrBtn.addEventListener('click', async (e) => {
+  e.stopPropagation();
+  try {
+    const session = await navigator.xr.requestSession('immersive-vr', {
+      optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'],
+    });
+    await renderer.xr.setSession(session);
+  } catch (err) {
+    msg.textContent = 'VR impossible : ' + err.message;
+  }
+});
+
+const ctrlFactory = new XRControllerModelFactory();
+const handFactory = new XRHandModelFactory();
+const ctrls = [0, 1].map((i) => {
+  const c = renderer.xr.getController(i);
+  c.addEventListener('connected', (e) => { c.userData.src = e.data; });
+  c.addEventListener('disconnected', () => { c.userData.src = null; if (aim === c) endAim(false); });
+  c.addEventListener('selectstart', () => { aim = c; });
+  c.addEventListener('selectend', () => { if (aim === c) endAim(true); });
+  rig.add(c);
+  const grip = renderer.xr.getControllerGrip(i);
+  grip.add(ctrlFactory.createControllerModel(grip));
+  rig.add(grip);
+  const hand = renderer.xr.getHand(i);
+  hand.add(handFactory.createHandModel(hand, 'mesh'));
+  rig.add(hand);
+  return c;
+});
+
+// teleport arc + landing ring
+const ARC_N = 48;
+const arcGeo = new THREE.BufferGeometry();
+arcGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(ARC_N * 3), 3));
+const arcMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, depthTest: false });
+const arc = new THREE.Line(arcGeo, arcMat);
+arc.frustumCulled = false; arc.renderOrder = 10; arc.visible = false;
+const ring = new THREE.Mesh(new THREE.RingGeometry(0.17, 0.22, 48).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, depthTest: false }));
+ring.renderOrder = 11; ring.visible = false;
+scene.add(arc, ring);
+let aim = null;
+const hit = new THREE.Vector3();
+let hitOK = false;
+const _o = new THREE.Vector3(), _d = new THREE.Vector3(), _p = new THREE.Vector3(), _prev = new THREE.Vector3();
+
+function updateAim() {
+  if (!aim) return;
+  rig.updateMatrixWorld(true);
+  _o.setFromMatrixPosition(aim.matrixWorld);
+  _d.set(0, 0, -1).transformDirection(aim.matrixWorld);
+  const straight = aim.userData.src?.targetRayMode === 'transient-pointer';   // Vision Pro: look + pinch
+  const arr = arcGeo.attributes.position.array;
+  let n = 0;
+  hitOK = false;
+  _prev.copy(_o);
+  for (let i = 0; i < ARC_N; i++) {
+    const t = i * 0.045;
+    if (straight) _p.copy(_o).addScaledVector(_d, t * 8);
+    else _p.set(_o.x + _d.x * 6.5 * t, _o.y + _d.y * 6.5 * t - 4.9 * t * t, _o.z + _d.z * 6.5 * t);
+    if (_p.y <= 0) {
+      const k = _prev.y / (_prev.y - _p.y);
+      _p.lerpVectors(_prev, _p, k); _p.y = 0;
+      arr.set([_p.x, 0.01, _p.z], n * 3); n++;
+      hit.copy(_p);
+      hitOK = walkable(_p.x, -_p.z);
+      break;
+    }
+    if (!inRoom(_p.x, -_p.z) || _p.y > 2.85) break;     // through a wall or the ceiling
+    arr.set([_p.x, _p.y, _p.z], n * 3); n++;
+    _prev.copy(_p);
+  }
+  arcGeo.setDrawRange(0, n);
+  arcGeo.attributes.position.needsUpdate = true;
+  arc.visible = n > 1;
+  const col = hitOK ? 0xffffff : 0xff5a4f;
+  arcMat.color.setHex(col);
+  ring.material.color.setHex(col);
+  ring.visible = n > 1 && _p.y === 0;
+  ring.position.set(hit.x, 0.012, hit.z);
+}
+function headPosition(v) { return v.setFromMatrixPosition(renderer.xr.getCamera().matrixWorld); }
+function endAim(go) {
+  if (go && hitOK) {
+    const h = headPosition(new THREE.Vector3());
+    rig.position.x += hit.x - h.x;
+    rig.position.z += hit.z - h.z;
+  }
+  aim = null; hitOK = false;
+  arc.visible = false; ring.visible = false;
+}
+
+// Frame budget watch in VR and on phones: if the device cannot hold its refresh rate with reflections, drop them.
+let frameN = 0, slow = 0, lastT = 0;
+function watchFrames(t) {
+  if (!window.__upgrade?.setLite || window.__upgrade.lite || q.has('keep')) return;
+  const dt = lastT ? t - lastT : 0;
+  lastT = t;
+  if (++frameN < 150 || !dt) return;               // let shaders compile and the headset settle
+  const rate = renderer.xr.getSession()?.frameRate || (renderer.xr.isPresenting ? 72 : 60);
+  slow = dt > 1000 / rate * 1.45 ? slow + 1 : Math.max(0, slow - 1);
+  if (slow > 45) {
+    window.__upgrade.setLite(true);
+    window.__upgrade.lite = true;
+    console.warn('frame rate too low, reflections switched off');
+  }
+}
+
+let turnReady = true;
+const _h = new THREE.Vector3(), _f = new THREE.Vector3();
+function xrStep(dt) {
+  const session = renderer.xr.getSession();
+  if (!session) return;
+  let mx = 0, my = 0, turn = 0, fast = false;
+  for (const src of session.inputSources) {
+    const gp = src.gamepad;
+    if (!gp) continue;
+    const ax = gp.axes.length >= 4 ? [gp.axes[2], gp.axes[3]] : [gp.axes[0] || 0, gp.axes[1] || 0];
+    if (src.handedness === 'left') { mx = ax[0]; my = ax[1]; fast = gp.buttons[1]?.pressed; }
+    else if (src.handedness === 'right') turn = ax[0];
+  }
+  const dz = (v) => (Math.abs(v) < 0.15 ? 0 : (v - Math.sign(v) * 0.15) / 0.85);
+  mx = dz(mx); my = dz(my);
+  const cam = renderer.xr.getCamera();
+  headPosition(_h);
+  if (mx || my) {
+    _f.set(0, 0, -1).transformDirection(cam.matrixWorld);
+    _f.y = 0; _f.normalize();
+    const sp = (fast ? 2.6 : 1.4) * dt;
+    const dx = (_f.x * -my - _f.z * mx) * sp, dzz = (_f.z * -my + _f.x * mx) * sp;
+    const stuck = !walkable(_h.x, -_h.z);
+    if (stuck || walkable(_h.x + dx, -_h.z)) { rig.position.x += dx; _h.x += dx; }
+    if (stuck || walkable(_h.x, -(_h.z + dzz))) rig.position.z += dzz;
+  }
+  if (Math.abs(turn) > 0.7 && turnReady) {
+    const a = -Math.sign(turn) * Math.PI / 6;          // 30 degree snap turn around the head
+    const ox = rig.position.x - _h.x, oz = rig.position.z - _h.z;
+    rig.position.x = _h.x + ox * Math.cos(a) + oz * Math.sin(a);
+    rig.position.z = _h.z - ox * Math.sin(a) + oz * Math.cos(a);
+    rig.rotation.y += a;
+    turnReady = false;
+  }
+  if (Math.abs(turn) < 0.3) turnReady = true;
+  updateAim();
+}
+
+renderer.xr.addEventListener('sessionstart', () => {
+  // start where the desktop view was, feet on the floor, facing the same way
+  rig.position.set(pos.x, 0, pos.z);
+  rig.rotation.set(0, yaw, 0);
+  camera.position.set(0, 0, 0);
+  camera.rotation.set(0, 0, 0);
+  document.getElementById('ui').classList.add('hidden');
+});
+renderer.xr.addEventListener('sessionend', () => {
+  const m = renderer.xr.getCamera().matrixWorld;
+  const h = new THREE.Vector3().setFromMatrixPosition(m);
+  const f = new THREE.Vector3(0, 0, -1).transformDirection(m);
+  rig.position.set(0, 0, 0);
+  rig.rotation.set(0, 0, 0);
+  pos.set(h.x, EYE, h.z);
+  yaw = Math.atan2(-f.x, -f.z); pitch = 0;
+  endAim(false);
+  document.getElementById('ui').classList.remove('hidden');
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop((t) => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (renderer.xr.isPresenting) { xrStep(dt); watchFrames(t); }
+  else { desktopStep(dt); if (touch) watchFrames(t); }
+  renderer.render(scene, camera);
+});
+window.__xr = { renderer, rig, camera, scene, walkable, G, THREE };
+// screenshots of several views from one page load (build/multi_shot.mjs): Blender coordinates
+window.__setView = (x, y, z, tx, ty, tz, fov) => {
+  pos = B(x, y, z); lookAt(B(tx, ty, tz));
+  if (fov) { camera.fov = fov; camera.updateProjectionMatrix(); }
+};
+</script>
+</body>
+</html>
